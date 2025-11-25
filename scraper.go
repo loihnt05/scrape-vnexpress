@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"io"
@@ -12,10 +13,34 @@ import (
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/debug"
 	"github.com/gocolly/colly/extensions"
+	"github.com/gocolly/colly/proxy"
+	"github.com/gocolly/colly/queue"
 	"github.com/hashicorp/go-retryablehttp"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/net/html"
+	"golang.org/x/time/rate"
 )
+
+var categories = map[int]string{
+	1001005: "Thời sự",
+	1003450: "Góc nhìn",
+	1001002: "Thế giới",
+	1003159: "Kinh doanh",
+	1005628: "Bất động sản",
+	1002691: "Giải trí",
+	1002565: "Thể thao",
+	1001007: "Pháp luật",
+	1003497: "Giáo dục",
+	1003750: "Sức khỏe",
+	1002966: "Đời sống",
+	1003231: "Du lịch",
+	1006219: "Khoa học công nghệ",
+	1001006: "Xe",
+	1001012: "Ý kiến",
+	1001014: "Tâm sự",
+	1001011: "Cười",
+	1004565: "Tuyến đầu chống dịch",
+}
 
 func extractLinksFromTitleNews(htmlContent string) []string {
 	var links []string
@@ -72,9 +97,11 @@ func extractLinksFromTitleNews(htmlContent string) []string {
 }
 
 type WriteRequest struct {
-	ArticleHtml string
-	Title       string
-	Description string
+	ArticleHtml  string
+	Title        string
+	Description  string
+	CategoryId   int64
+	CategoryName string
 }
 
 type Scraper struct {
@@ -142,9 +169,16 @@ func CreateSraper(options Options) *Scraper {
 	newsCollector := colly.NewCollector(
 		colly.CacheDir("./cache"),
 		colly.AllowedDomains("vnexpress.net"),
-		colly.Async(true),
+		colly.Async(false),
 		colly.Debugger(&debug.LogDebugger{}),
 	)
+
+	rp, err := proxy.RoundRobinProxySwitcher("socks5://103.191.218.253:8199", "socks5://8.219.59.81:1011")
+	if err != nil {
+		log.Fatal(err)
+	}
+	newsCollector.SetProxyFunc(rp)
+
 	scraper := &Scraper{
 		client:        retryablehttp.NewClient(),
 		options:       options,
@@ -168,25 +202,34 @@ func (s *Scraper) ProcessWrite() {
 
 	for item := range s.writes {
 		// Log start of processing
-		fmt.Printf("📝 Processing Write/Update for: **%s**\n", item.Title)
+		fmt.Printf("Processing Write/Update for: **%s**\n", item.Title)
 
 		// Execute the SQL upsert
 		_, err := s.db.Exec(upsertSQL, item.Title, item.Description, item.ArticleHtml)
 		if err != nil {
 			log.Printf("❌ Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {
-			fmt.Printf("✅ Successfully wrote/updated article: %s\n", item.Title)
+			fmt.Printf("Successfully wrote/updated article: %s\n", item.Title)
 		}
 	}
-	// Log that the writer is done
-	fmt.Println("--- Write process finished. ---")
 }
 
 func (s *Scraper) Scrape() {
 	s.wg.Go(s.ProcessWrite)
 
+	q, err := queue.New(
+		1, // Number of consumer threads
+		&queue.InMemoryQueueStorage{MaxSize: 10000}, // Use default queue storage
+	)
+
+	if err != nil {
+		panic(err)
+	}
+
 	// Start iterating from the initial StartTime
 	currentTime := s.options.StartTime
+
+	limiter := rate.NewLimiter(rate.Every(1000*time.Millisecond), 5)
 
 	for currentTime.Before(s.options.EndTime) {
 		dayStart := time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentTime.Location())
@@ -198,22 +241,29 @@ func (s *Scraper) Scrape() {
 			scrapeEnd = s.options.EndTime
 		}
 
-		fmt.Printf("Scraping from %v to %v\n", dayStart, scrapeEnd)
+		for categoryId := range categories {
+			s.wg.Go(func() {
+				err := limiter.Wait(context.Background())
+				if err != nil {
+					panic(err)
+				}
+				result, err := s.GetPage(dayStart, scrapeEnd, int64(categoryId))
+				if err != nil {
+					panic(err)
+				}
 
-		result, err := s.GetPage(dayStart, scrapeEnd)
-		if err != nil {
-			panic(err)
-		}
+				links := extractLinksFromTitleNews(result)
 
-		links := extractLinksFromTitleNews(result)
-
-		for _, link := range links {
-			s.newsCollector.Visit(link)
+				for _, link := range links {
+					q.AddURL(link)
+				}
+			})
 		}
 
 		currentTime = nextDayStart
 	}
 
+	q.Run(s.newsCollector)
 	s.newsCollector.Wait()
 
 	close(s.writes)

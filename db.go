@@ -19,7 +19,9 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 	CREATE TABLE IF NOT EXISTS articles (
 		"title" TEXT NOT NULL UNIQUE, "description" TEXT,
 		"article_html" TEXT,
-		"scraped_at" DATETIME DEFAULT CURRENT_TIMESTAMP
+		"scraped_at" DATETIME DEFAULT CURRENT_TIMESTAMP,
+		"category_id" TEXT NOT NULL,
+		"category_name" TEXT NOT NULL
 	);`
 
 	_, err = db.Exec(createTableSQL)
