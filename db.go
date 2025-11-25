@@ -17,17 +17,48 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 	// 2. Create the articles table if it doesn't exist
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS articles (
-		"title" TEXT NOT NULL UNIQUE, "description" TEXT,
+		"url" TEXT NOT NULL UNIQUE,
+		"title" TEXT,
+		"description" TEXT,
 		"article_html" TEXT,
 		"scraped_at" DATETIME DEFAULT CURRENT_TIMESTAMP,
-		"category_id" TEXT NOT NULL,
-		"category_name" TEXT NOT NULL
+		"category_id" TEXT,
+		"category_name" TEXT
 	);`
 
 	_, err = db.Exec(createTableSQL)
 	if err != nil {
 		db.Close()
 		return nil, fmt.Errorf("error creating table: %w", err)
+	}
+
+	// Ensure migrations: if `url` column was not present in an older DB, add it.
+	// Check table info for `articles` and add the `url` column if missing.
+	rows, err := db.Query(`PRAGMA table_info(articles);`)
+	if err == nil {
+		defer rows.Close()
+		hasURL := false
+		for rows.Next() {
+			var cid int
+			var name string
+			var ctype string
+			var notnull int
+			var dflt_value interface{}
+			var pk int
+			if err := rows.Scan(&cid, &name, &ctype, &notnull, &dflt_value, &pk); err == nil {
+				if name == "url" {
+					hasURL = true
+					break
+				}
+			}
+		}
+		if !hasURL {
+			_, err := db.Exec(`ALTER TABLE articles ADD COLUMN url TEXT;`)
+			if err == nil {
+				// Create a unique index on url to mimic the new schema uniqueness
+				_, _ = db.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS idx_articles_url ON articles(url);`)
+			}
+		}
 	}
 
 	fmt.Printf("Database initialized at %s\n", dbPath)

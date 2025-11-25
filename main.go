@@ -9,7 +9,6 @@ func main() {
 	fmt.Println("helo")
 	scraper := CreateSraper(Options{
 		StartTime: time.Date(2020, time.January, 1, 0, 0, 0, 0, time.UTC),
-		EndTime:   time.Now(),
-	})
+		EndTime:   time.Date(2020, time.January, 2, 0, 0, 0, 0, time.UTC)})
 	scraper.Scrape()
 }
