@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gocolly/colly"
+	"github.com/gocolly/colly/debug"
 	"github.com/hashicorp/go-retryablehttp"
 	"golang.org/x/net/html"
 )
@@ -76,6 +78,7 @@ type Scraper struct {
 	client        *retryablehttp.Client
 	newsCollector *colly.Collector
 	options       Options
+	wg            *sync.WaitGroup
 }
 
 type Options struct {
@@ -128,31 +131,39 @@ func CreateSraper(options Options) *Scraper {
 	newsCollector := colly.NewCollector(
 		colly.CacheDir("./cache"),
 		colly.AllowedDomains("vnexpress.net"),
-		// colly.Debugger(&debug.LogDebugger{}),
+		colly.Async(true),
+		colly.Debugger(&debug.LogDebugger{}),
 	)
 	scraper := &Scraper{
 		client:        retryablehttp.NewClient(),
 		options:       options,
 		newsCollector: newsCollector,
 		writes:        make(chan WriteRequest, 10000),
+		wg:            &sync.WaitGroup{},
 	}
 	scraper.Setup()
 	return scraper
 }
 
 func (s *Scraper) ProcessWrite() {
+	// This loop runs in a separate goroutine and continuously
+	// processes items from the s.writes channel until it's closed.
+	for item := range s.writes {
+		// Replace this with actual write/storage logic (e.g., saving to DB, file, etc.)
+		fmt.Printf("Processing: %s\n", item.Title)
+	}
+	// Optional: Log that the writer is done
+	fmt.Println("Write process finished.")
 }
 
 func (s *Scraper) Scrape() {
+	s.wg.Go(s.ProcessWrite)
+
 	// Start iterating from the initial StartTime
 	currentTime := s.options.StartTime
 
 	for currentTime.Before(s.options.EndTime) {
 		dayStart := time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentTime.Location())
-
-		// Calculate the end of the current day (23:59:59)
-		// This is achieved by taking the start of the *next* day and subtracting a nanosecond.
-		// Alternatively, you could use dayStart.Add(24 * time.Hour).Add(-time.Nanosecond)
 		nextDayStart := dayStart.AddDate(0, 0, 1)
 		dayEnd := nextDayStart.Add(-time.Nanosecond)
 
@@ -163,34 +174,29 @@ func (s *Scraper) Scrape() {
 
 		fmt.Printf("Scraping from %v to %v\n", dayStart, scrapeEnd)
 
-		// Pass dayStart and scrapeEnd to GetPage
 		result, err := s.GetPage(dayStart, scrapeEnd)
 		if err != nil {
-			// Decide whether to panic or log the error and continue to the next day
 			panic(err)
 		}
 
 		links := extractLinksFromTitleNews(result)
 
-		// Use a temporary collector or ensure the main collector can handle concurrent
-		// or sequential runs if you want to call Wait() inside the loop.
 		for _, link := range links {
 			s.newsCollector.Visit(link)
 		}
-		s.newsCollector.Wait()
-		// Note: s.newsCollector.Wait() here means you wait for all links for the current day
-		// to be processed before moving to the next day.
 
-		// --- End of scraping logic for the current day range ---
+		// Wait for all HTTP visits (and resulting channel sends) to complete
+		// for the current day before moving to the next day.
+		s.newsCollector.Wait()
 
 		// Move to the start of the next day for the loop condition
 		currentTime = nextDayStart
 	}
 
-	// Process all collected items after the loop finishes
+	// 3. Close the channel. This signals the 'for item := range s.writes' loop
+	// in ProcessWrite to exit gracefully.
 	close(s.writes)
 
-	for item := range s.writes {
-		fmt.Println(item.Title)
-	}
+	// 4. Wait for the ProcessWrite goroutine to finish its work
+	s.wg.Wait()
 }
