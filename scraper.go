@@ -13,7 +13,6 @@ import (
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/debug"
 	"github.com/gocolly/colly/extensions"
-	"github.com/gocolly/colly/queue"
 	"github.com/hashicorp/go-retryablehttp"
 	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/net/html"
@@ -106,6 +105,7 @@ type WriteRequest struct {
 
 type Scraper struct {
 	writes        chan WriteRequest
+	links         chan string
 	client        *retryablehttp.Client
 	newsCollector *colly.Collector
 	options       Options
@@ -186,6 +186,7 @@ func CreateSraper(options Options) *Scraper {
 		options:       options,
 		newsCollector: newsCollector,
 		writes:        make(chan WriteRequest, 10000),
+		links:         make(chan string, 10000),
 		wg:            &sync.WaitGroup{},
 		db:            db,
 	}
@@ -232,16 +233,22 @@ func (s *Scraper) LinkExists(url string) (bool, error) {
 	return true, nil
 }
 
+func (s *Scraper) ConsumeLinks() {
+	for link := range s.links {
+		err := s.newsCollector.Visit(link)
+		if err != nil {
+			log.Printf("Error visiting %s: %v\n", link, err)
+		}
+	}
+}
+
 func (s *Scraper) Scrape() {
 	s.wg.Go(s.ProcessWrite)
 
-	q, err := queue.New(
-		1, // Number of consumer threads
-		&queue.InMemoryQueueStorage{MaxSize: 10000}, // Use default queue storage
-	)
-
-	if err != nil {
-		panic(err)
+	// Start link consumers
+	numConsumers := 3
+	for i := 0; i < numConsumers; i++ {
+		s.wg.Go(s.ConsumeLinks)
 	}
 
 	// Start iterating from the initial StartTime
@@ -278,14 +285,14 @@ func (s *Scraper) Scrape() {
 					exists, err := s.LinkExists(link)
 					if err != nil {
 						log.Printf("error checking link existence for %s: %v — will queue it", link, err)
-						q.AddURL(link)
+						s.links <- link
 						continue
 					}
 					if exists {
 						log.Printf("Skipping already-saved link: %s\n", link)
 						continue
 					}
-					q.AddURL(link)
+					s.links <- link
 				}
 			})
 		}
@@ -294,7 +301,8 @@ func (s *Scraper) Scrape() {
 	}
 
 	linkGeneratorWg.Wait()
-	q.Run(s.newsCollector)
+	close(s.links)
+
 	s.newsCollector.Wait()
 
 	close(s.writes)
