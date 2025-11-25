@@ -14,7 +14,6 @@ import (
 	"github.com/gocolly/colly/debug"
 	"github.com/gocolly/colly/extensions"
 	"github.com/hashicorp/go-retryablehttp"
-	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/net/html"
 	"golang.org/x/time/rate"
 )
@@ -305,7 +304,7 @@ func CreateSraper(options Options) *Scraper {
 	if options.Parallelism == 0 {
 		options.Parallelism = 4
 	}
-	db, err := setupDatabase(dbPath)
+	db, err := setupDatabase()
 	if err != nil {
 		panic(err)
 	}
@@ -339,7 +338,7 @@ func CreateSraper(options Options) *Scraper {
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
 		INSERT INTO articles(url, title, description, content, published_date)
-		VALUES(?, ?, ?, ?, ?)
+		VALUES($1, $2, $3, $4, $5)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
@@ -364,7 +363,7 @@ func (s *Scraper) ProcessWrite() {
 // LinkExists checks whether a given URL already exists in the articles table.
 func (s *Scraper) LinkExists(url string) (bool, error) {
 	var v int
-	err := s.db.QueryRow("SELECT 1 FROM articles WHERE url = ? LIMIT 1", url).Scan(&v)
+	err := s.db.QueryRow("SELECT 1 FROM articles WHERE url = $1 LIMIT 1", url).Scan(&v)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
