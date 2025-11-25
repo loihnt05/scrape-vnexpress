@@ -1,13 +1,11 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"database/sql"
 	"fmt"
 	"io"
 	"log"
-	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -15,7 +13,6 @@ import (
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/debug"
 	"github.com/gocolly/colly/extensions"
-	"github.com/gocolly/colly/proxy"
 	"github.com/gocolly/colly/queue"
 	"github.com/hashicorp/go-retryablehttp"
 	_ "github.com/mattn/go-sqlite3"
@@ -23,69 +20,25 @@ import (
 	"golang.org/x/time/rate"
 )
 
-// getProxiesAsStrings fetches content from the given URL and returns it as a slice of strings,
-// where each element is a non-empty line from the response body.
-// It will panic immediately if any error occurs during fetching or reading.
-func getProxiesAsStrings() []string {
-	url := "https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&proxy_format=protocolipport&format=text"
-	// 1. Perform the HTTP GET request.
-	resp, err := http.Get(url)
-	if err != nil {
-		// Panic immediately on request error
-		panic(fmt.Errorf("error performing request to %s: %w", url, err))
-	}
-	// Ensure the response body is closed when the function returns.
-	defer resp.Body.Close()
-
-	// 2. Check for a successful status code.
-	if resp.StatusCode != http.StatusOK {
-		// Panic immediately on non-OK status
-		panic(fmt.Errorf("received non-OK HTTP status code: %d %s", resp.StatusCode, resp.Status))
-	}
-
-	// 3. Initialize a slice to hold the lines (proxies).
-	var lines []string
-
-	// 4. Use bufio.NewScanner to read the response body line by line.
-	// This is efficient for reading stream data like HTTP response bodies.
-	scanner := bufio.NewScanner(resp.Body)
-
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// Only add non-empty lines to the result slice.
-		if line != "" {
-			lines = append(lines, line)
-		}
-	}
-
-	// 5. Check for any errors encountered during scanning/reading.
-	if err := scanner.Err(); err != nil && err != io.EOF {
-		// Panic immediately on scanner/read error
-		panic(fmt.Errorf("error reading response body: %w", err))
-	}
-
-	return lines
-}
-
 var categories = map[int]string{
 	1001005: "Thời sự",
-	// 1003450: "Góc nhìn",
-	// 1001002: "Thế giới",
-	// 1003159: "Kinh doanh",
-	// 1005628: "Bất động sản",
-	// 1002691: "Giải trí",
-	// 1002565: "Thể thao",
-	// 1001007: "Pháp luật",
-	// 1003497: "Giáo dục",
-	// 1003750: "Sức khỏe",
-	// 1002966: "Đời sống",
-	// 1003231: "Du lịch",
-	// 1006219: "Khoa học công nghệ",
-	// 1001006: "Xe",
-	// 1001012: "Ý kiến",
-	// 1001014: "Tâm sự",
-	// 1001011: "Cười",
-	// 1004565: "Tuyến đầu chống dịch",
+
+	1001002: "Thế giới",
+	1003159: "Kinh doanh",
+	1005628: "Bất động sản",
+	1002691: "Giải trí",
+	1002565: "Thể thao",
+	1001007: "Pháp luật",
+	1003497: "Giáo dục",
+	1003750: "Sức khỏe",
+	1002966: "Đời sống",
+	1003231: "Du lịch",
+	1006219: "Khoa học công nghệ",
+	1001006: "Xe",
+	1001012: "Ý kiến",
+	1001014: "Tâm sự",
+	1001011: "Cười",
+	1004565: "Tuyến đầu chống dịch",
 }
 
 func extractLinksFromTitleNews(htmlContent string) []string {
@@ -94,7 +47,7 @@ func extractLinksFromTitleNews(htmlContent string) []string {
 	// 1. Create a new tokenizer over the HTML content
 	doc, err := html.Parse(strings.NewReader(htmlContent))
 	if err != nil {
-		fmt.Printf("Error parsing HTML: %v\n", err)
+		log.Printf("Error parsing HTML: %v\n", err)
 		return links // Return empty list on parse error
 	}
 
@@ -217,15 +170,16 @@ func CreateSraper(options Options) *Scraper {
 	newsCollector := colly.NewCollector(
 		colly.CacheDir("./cache"),
 		colly.AllowedDomains("vnexpress.net"),
-		colly.Async(false),
+		colly.Async(true),
 		colly.Debugger(&debug.LogDebugger{}),
 	)
+	newsCollector.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: 3})
 
-	rp, err := proxy.RoundRobinProxySwitcher(getProxiesAsStrings()...)
-	if err != nil {
-		log.Fatal(err)
-	}
-	newsCollector.SetProxyFunc(rp)
+	// rp, err := proxy.RoundRobinProxySwitcher("socks4://147.45.170.65:1080")
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+	// newsCollector.SetProxyFunc(rp)
 
 	scraper := &Scraper{
 		client:        retryablehttp.NewClient(),
@@ -241,24 +195,26 @@ func CreateSraper(options Options) *Scraper {
 
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
-		INSERT INTO articles(url, title, description, article_html)
-		VALUES(?, ?, ?, ?)
+		INSERT INTO articles(url, title, description, article_html, category_id, category_name)
+		VALUES(?, ?, ?, ?, ?, ?)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
-			article_html = EXCLUDED.article_html;
+			article_html = EXCLUDED.article_html,
+			category_id = EXCLUDED.category_id,
+			category_name = EXCLUDED.category_name;
 	`
 
 	for item := range s.writes {
 		// Log start of processing
-		fmt.Printf("Processing Write/Update for: **%s**\n", item.Title)
+		log.Printf("Processing Write/Update for: **%s**\n", item.Title)
 
 		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.ArticleHtml)
+		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.ArticleHtml, item.CategoryId, item.CategoryName)
 		if err != nil {
 			log.Printf("❌ Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {
-			fmt.Printf("Successfully wrote/updated article: %s\n", item.Title)
+			log.Printf("Successfully wrote/updated article: %s\n", item.Title)
 		}
 	}
 }
@@ -293,6 +249,7 @@ func (s *Scraper) Scrape() {
 
 	limiter := rate.NewLimiter(rate.Every(1000*time.Millisecond), 5)
 
+	linkGeneratorWg := &sync.WaitGroup{}
 	for currentTime.Before(s.options.EndTime) {
 		dayStart := time.Date(currentTime.Year(), currentTime.Month(), currentTime.Day(), 0, 0, 0, 0, currentTime.Location())
 		nextDayStart := dayStart.AddDate(0, 0, 1)
@@ -304,7 +261,7 @@ func (s *Scraper) Scrape() {
 		}
 
 		for categoryId := range categories {
-			s.wg.Go(func() {
+			linkGeneratorWg.Go(func() {
 				err := limiter.Wait(context.Background())
 				if err != nil {
 					panic(err)
@@ -325,7 +282,7 @@ func (s *Scraper) Scrape() {
 						continue
 					}
 					if exists {
-						fmt.Printf("Skipping already-saved link: %s\n", link)
+						log.Printf("Skipping already-saved link: %s\n", link)
 						continue
 					}
 					q.AddURL(link)
@@ -336,7 +293,9 @@ func (s *Scraper) Scrape() {
 		currentTime = nextDayStart
 	}
 
+	linkGeneratorWg.Wait()
 	q.Run(s.newsCollector)
+	s.newsCollector.Wait()
 
 	close(s.writes)
 
