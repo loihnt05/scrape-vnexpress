@@ -95,12 +95,11 @@ func extractLinksFromTitleNews(htmlContent string) []string {
 }
 
 type WriteRequest struct {
-	ArticleHtml  string
-	Title        string
-	Description  string
-	URL          string
-	CategoryId   int64
-	CategoryName string
+	ArticleHtml   string
+	Title         string
+	Description   string
+	URL           string
+	PublishedDate time.Time
 }
 
 type Scraper struct {
@@ -139,19 +138,69 @@ func (s *Scraper) GetPage(startTime time.Time, endTime time.Time, categoryId int
 
 func (s *Scraper) Setup() {
 	s.newsCollector.OnHTML("div.container.detail-new", func(e *colly.HTMLElement) {
-		// date := e.ChildText("span.date")
 		title := e.ChildText("h1.title-detail")
 		description := e.ChildText("p.description")
+		
+		// Parse the published date - VNExpress uses meta tags for accurate dates
+		var publishedDate time.Time
+		
+		// Try to get from meta tag first (most reliable)
+		metaDate := e.ChildAttr("meta[name='pubdate']", "content")
+		if metaDate == "" {
+			metaDate = e.ChildAttr("meta[property='article:published_time']", "content")
+		}
+		
+		if metaDate != "" {
+			// Meta tags usually use ISO8601 format
+			formats := []string{
+				time.RFC3339,
+				"2006-01-02T15:04:05-07:00",
+				"2006-01-02T15:04:05Z",
+			}
+			for _, format := range formats {
+				if parsed, err := time.Parse(format, metaDate); err == nil {
+					publishedDate = parsed
+					break
+				}
+			}
+		}
+		
+	// Fallback to visible date text
+	if publishedDate.IsZero() {
+		dateStr := e.ChildText("span.date")
+		if dateStr != "" {
+			// VNExpress format: "Thứ hai, 24/11/2025, 09:35 (GMT+7)"
+			// Remove Vietnamese day name and parse the date/time part
+			dateStr = strings.TrimSpace(dateStr)
+			
+			// Remove Vietnamese day name (everything before first comma)
+			parts := strings.SplitN(dateStr, ",", 2)
+			if len(parts) == 2 {
+				dateStr = strings.TrimSpace(parts[1])
+			}
+			
+			// Now dateStr should be like "24/11/2025, 09:35 (GMT+7)"
+			// Parse with format: "02/01/2006, 15:04 (GMT+7)"
+			parsed, err := time.Parse("2/1/2006, 15:04 (GMT+7)", dateStr)
+			if err == nil {
+				publishedDate = parsed
+			}
+		}
+	}
+	
+	log.Printf("Extracted date for '%s': %v (raw meta: %s)\n", title, publishedDate, metaDate)
+		
 		e.ForEach("article.fck_detail ", func(i int, e *colly.HTMLElement) {
 			html, err := e.DOM.Html()
 			if err != nil {
 				panic(err)
 			}
 			request := WriteRequest{
-				ArticleHtml: html,
-				Title:       title,
-				URL:         e.Request.URL.String(),
-				Description: description,
+				ArticleHtml:   html,
+				Title:         title,
+				URL:           e.Request.URL.String(),
+				Description:   description,
+				PublishedDate: publishedDate,
 			}
 
 			s.writes <- request
@@ -200,14 +249,13 @@ func CreateSraper(options Options) *Scraper {
 
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
-		INSERT INTO articles(url, title, description, article_html, category_id, category_name)
-		VALUES(?, ?, ?, ?, ?, ?)
+		INSERT INTO articles(url, title, description, article_html, published_date)
+		VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
 			article_html = EXCLUDED.article_html,
-			category_id = EXCLUDED.category_id,
-			category_name = EXCLUDED.category_name;
+			published_date = EXCLUDED.published_date;
 	`
 
 	for item := range s.writes {
@@ -215,7 +263,7 @@ func (s *Scraper) ProcessWrite() {
 		log.Printf("Processing Write/Update for: **%s**\n", item.Title)
 
 		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.ArticleHtml, item.CategoryId, item.CategoryName)
+		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.ArticleHtml, item.PublishedDate)
 		if err != nil {
 			log.Printf("❌ Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {

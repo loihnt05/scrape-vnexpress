@@ -23,8 +23,7 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 		"description" TEXT,
 		"article_html" TEXT,
 		"scraped_at" DATETIME DEFAULT CURRENT_TIMESTAMP,
-		"category_id" TEXT,
-		"category_name" TEXT
+		"published_date" DATETIME
 	);`
 
 	_, err = db.Exec(createTableSQL)
