@@ -16,6 +16,7 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 
 	// 2. Create the articles table if it doesn't exist
 	createTableSQL := `
+	PRAGMA journal_mode=WAL;
 	CREATE TABLE IF NOT EXISTS articles (
 		"url" TEXT NOT NULL UNIQUE,
 		"title" TEXT,
