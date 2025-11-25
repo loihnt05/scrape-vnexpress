@@ -114,8 +114,9 @@ type Scraper struct {
 }
 
 type Options struct {
-	StartTime time.Time
-	EndTime   time.Time
+	StartTime   time.Time
+	EndTime     time.Time
+	Parallelism int
 }
 
 // categoryId 1003159
@@ -163,6 +164,9 @@ func (s *Scraper) Setup() {
 }
 
 func CreateSraper(options Options) *Scraper {
+	if options.Parallelism == 0 {
+		options.Parallelism = 4
+	}
 	db, err := setupDatabase(dbPath)
 	if err != nil {
 		panic(err)
@@ -173,7 +177,7 @@ func CreateSraper(options Options) *Scraper {
 		colly.Async(true),
 		colly.Debugger(&debug.LogDebugger{}),
 	)
-	newsCollector.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: 3})
+	newsCollector.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: options.Parallelism})
 
 	// rp, err := proxy.RoundRobinProxySwitcher("socks4://147.45.170.65:1080")
 	// if err != nil {
