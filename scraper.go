@@ -14,10 +14,77 @@ import (
 	"github.com/gocolly/colly/debug"
 	"github.com/gocolly/colly/extensions"
 	"github.com/hashicorp/go-retryablehttp"
-	_ "github.com/mattn/go-sqlite3"
 	"golang.org/x/net/html"
 	"golang.org/x/time/rate"
 )
+
+// extractTextContent extracts clean text from HTML, preserving paragraphs
+func extractTextContent(htmlContent string) string {
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		log.Printf("Error parsing HTML for text extraction: %v\n", err)
+		return ""
+	}
+
+	var textBuilder strings.Builder
+	var f func(*html.Node)
+
+	f = func(n *html.Node) {
+		// Skip script and style tags entirely
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "script", "style", "noscript":
+				return // Don't process these tags or their children
+			}
+		}
+
+		if n.Type == html.TextNode {
+			text := strings.TrimSpace(n.Data)
+			if text != "" {
+				textBuilder.WriteString(text)
+				textBuilder.WriteString(" ")
+			}
+		}
+		// Add newlines after paragraphs and other block elements for better formatting
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6":
+				if textBuilder.Len() > 0 && !strings.HasSuffix(textBuilder.String(), "\n") {
+					textBuilder.WriteString("\n")
+				}
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+
+		// Add newline after block elements
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "p", "div", "h1", "h2", "h3", "h4", "h5", "h6":
+				if textBuilder.Len() > 0 && !strings.HasSuffix(textBuilder.String(), "\n") {
+					textBuilder.WriteString("\n")
+				}
+			}
+		}
+	}
+
+	f(doc)
+
+	// Clean up the text: remove multiple spaces and newlines
+	text := textBuilder.String()
+	lines := strings.Split(text, "\n")
+	var cleanedLines []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			cleanedLines = append(cleanedLines, line)
+		}
+	}
+
+	return strings.Join(cleanedLines, "\n\n")
+}
 
 var categories = map[int]string{
 	1001005: "Thời sự",
@@ -95,12 +162,11 @@ func extractLinksFromTitleNews(htmlContent string) []string {
 }
 
 type WriteRequest struct {
-	ArticleHtml  string
-	Title        string
-	Description  string
-	URL          string
-	CategoryId   int64
-	CategoryName string
+	Content       string
+	Title         string
+	Description   string
+	URL           string
+	PublishedDate time.Time
 }
 
 type Scraper struct {
@@ -139,19 +205,90 @@ func (s *Scraper) GetPage(startTime time.Time, endTime time.Time, categoryId int
 
 func (s *Scraper) Setup() {
 	s.newsCollector.OnHTML("div.container.detail-new", func(e *colly.HTMLElement) {
-		// date := e.ChildText("span.date")
 		title := e.ChildText("h1.title-detail")
 		description := e.ChildText("p.description")
-		e.ForEach("article.fck_detail ", func(i int, e *colly.HTMLElement) {
-			html, err := e.DOM.Html()
-			if err != nil {
-				panic(err)
+		
+		// Parse the published date - VNExpress uses meta tags for accurate dates
+		var publishedDate time.Time
+		
+		// Try to get from meta tag first (most reliable)
+		metaDate := e.ChildAttr("meta[name='pubdate']", "content")
+		if metaDate == "" {
+			metaDate = e.ChildAttr("meta[property='article:published_time']", "content")
+		}
+		
+		if metaDate != "" {
+			// Meta tags usually use ISO8601 format
+			formats := []string{
+				time.RFC3339,
+				"2006-01-02T15:04:05-07:00",
+				"2006-01-02T15:04:05Z",
 			}
+			for _, format := range formats {
+				if parsed, err := time.Parse(format, metaDate); err == nil {
+					publishedDate = parsed
+					break
+				}
+			}
+		}
+		
+	// Fallback to visible date text
+	if publishedDate.IsZero() {
+		dateStr := e.ChildText("span.date")
+		if dateStr != "" {
+			// VNExpress format: "Thứ hai, 24/11/2025, 09:35 (GMT+7)"
+			// Remove Vietnamese day name and parse the date/time part
+			dateStr = strings.TrimSpace(dateStr)
+			
+			// Remove Vietnamese day name (everything before first comma)
+			parts := strings.SplitN(dateStr, ",", 2)
+			if len(parts) == 2 {
+				dateStr = strings.TrimSpace(parts[1])
+			}
+			
+			// Now dateStr should be like "24/11/2025, 09:35 (GMT+7)"
+			// Parse with format: "02/01/2006, 15:04 (GMT+7)"
+			parsed, err := time.Parse("2/1/2006, 15:04 (GMT+7)", dateStr)
+			if err == nil {
+				publishedDate = parsed
+			}
+		}
+	}
+	
+	log.Printf("Extracted date for '%s': %v (raw meta: %s)\n", title, publishedDate, metaDate)
+		
+		e.ForEach("article.fck_detail ", func(i int, e *colly.HTMLElement) {
+			// Extract all paragraph text from the article
+			var contentParts []string
+			
+			// Get text from all paragraphs in the article
+			e.ForEach("p.Normal", func(_ int, p *colly.HTMLElement) {
+				text := strings.TrimSpace(p.Text)
+				if text != "" {
+					contentParts = append(contentParts, text)
+				}
+			})
+			
+			// If no paragraphs with class "Normal", try getting all <p> tags
+			if len(contentParts) == 0 {
+				e.ForEach("p", func(_ int, p *colly.HTMLElement) {
+					text := strings.TrimSpace(p.Text)
+					// Skip author, photo credit, and other metadata
+					if text != "" && !strings.Contains(p.Attr("class"), "author") && 
+					   !strings.Contains(p.Attr("class"), "Image") {
+						contentParts = append(contentParts, text)
+					}
+				})
+			}
+			
+			textContent := strings.Join(contentParts, "\n\n")
+			
 			request := WriteRequest{
-				ArticleHtml: html,
-				Title:       title,
-				URL:         e.Request.URL.String(),
-				Description: description,
+				Content:       textContent,
+				Title:         title,
+				URL:           e.Request.URL.String(),
+				Description:   description,
+				PublishedDate: publishedDate,
 			}
 
 			s.writes <- request
@@ -167,7 +304,7 @@ func CreateSraper(options Options) *Scraper {
 	if options.Parallelism == 0 {
 		options.Parallelism = 4
 	}
-	db, err := setupDatabase(dbPath)
+	db, err := setupDatabase()
 	if err != nil {
 		panic(err)
 	}
@@ -200,14 +337,13 @@ func CreateSraper(options Options) *Scraper {
 
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
-		INSERT INTO articles(url, title, description, article_html, category_id, category_name)
-		VALUES(?, ?, ?, ?, ?, ?)
+		INSERT INTO articles(url, title, description, content, published_date)
+		VALUES($1, $2, $3, $4, $5)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
-			article_html = EXCLUDED.article_html,
-			category_id = EXCLUDED.category_id,
-			category_name = EXCLUDED.category_name;
+			content = EXCLUDED.content,
+			published_date = EXCLUDED.published_date;
 	`
 
 	for item := range s.writes {
@@ -215,9 +351,9 @@ func (s *Scraper) ProcessWrite() {
 		log.Printf("Processing Write/Update for: **%s**\n", item.Title)
 
 		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.ArticleHtml, item.CategoryId, item.CategoryName)
+		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.PublishedDate)
 		if err != nil {
-			log.Printf("❌ Error writing/updating article '%s' to database: %v", item.Title, err)
+			log.Printf("Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {
 			log.Printf("Successfully wrote/updated article: %s\n", item.Title)
 		}
@@ -227,7 +363,7 @@ func (s *Scraper) ProcessWrite() {
 // LinkExists checks whether a given URL already exists in the articles table.
 func (s *Scraper) LinkExists(url string) (bool, error) {
 	var v int
-	err := s.db.QueryRow("SELECT 1 FROM articles WHERE url = ? LIMIT 1", url).Scan(&v)
+	err := s.db.QueryRow("SELECT 1 FROM articles WHERE url = $1 LIMIT 1", url).Scan(&v)
 	if err == sql.ErrNoRows {
 		return false, nil
 	}
