@@ -19,6 +19,74 @@ import (
 	"golang.org/x/time/rate"
 )
 
+// extractTextContent extracts clean text from HTML, preserving paragraphs
+func extractTextContent(htmlContent string) string {
+	doc, err := html.Parse(strings.NewReader(htmlContent))
+	if err != nil {
+		log.Printf("Error parsing HTML for text extraction: %v\n", err)
+		return ""
+	}
+
+	var textBuilder strings.Builder
+	var f func(*html.Node)
+
+	f = func(n *html.Node) {
+		// Skip script and style tags entirely
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "script", "style", "noscript":
+				return // Don't process these tags or their children
+			}
+		}
+
+		if n.Type == html.TextNode {
+			text := strings.TrimSpace(n.Data)
+			if text != "" {
+				textBuilder.WriteString(text)
+				textBuilder.WriteString(" ")
+			}
+		}
+		// Add newlines after paragraphs and other block elements for better formatting
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "p", "div", "br", "h1", "h2", "h3", "h4", "h5", "h6":
+				if textBuilder.Len() > 0 && !strings.HasSuffix(textBuilder.String(), "\n") {
+					textBuilder.WriteString("\n")
+				}
+			}
+		}
+
+		for c := n.FirstChild; c != nil; c = c.NextSibling {
+			f(c)
+		}
+
+		// Add newline after block elements
+		if n.Type == html.ElementNode {
+			switch n.Data {
+			case "p", "div", "h1", "h2", "h3", "h4", "h5", "h6":
+				if textBuilder.Len() > 0 && !strings.HasSuffix(textBuilder.String(), "\n") {
+					textBuilder.WriteString("\n")
+				}
+			}
+		}
+	}
+
+	f(doc)
+
+	// Clean up the text: remove multiple spaces and newlines
+	text := textBuilder.String()
+	lines := strings.Split(text, "\n")
+	var cleanedLines []string
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			cleanedLines = append(cleanedLines, line)
+		}
+	}
+
+	return strings.Join(cleanedLines, "\n\n")
+}
+
 var categories = map[int]string{
 	1001005: "Thời sự",
 
@@ -95,7 +163,7 @@ func extractLinksFromTitleNews(htmlContent string) []string {
 }
 
 type WriteRequest struct {
-	ArticleHtml   string
+	Content       string
 	Title         string
 	Description   string
 	URL           string
@@ -191,12 +259,33 @@ func (s *Scraper) Setup() {
 	log.Printf("Extracted date for '%s': %v (raw meta: %s)\n", title, publishedDate, metaDate)
 		
 		e.ForEach("article.fck_detail ", func(i int, e *colly.HTMLElement) {
-			html, err := e.DOM.Html()
-			if err != nil {
-				panic(err)
+			// Extract all paragraph text from the article
+			var contentParts []string
+			
+			// Get text from all paragraphs in the article
+			e.ForEach("p.Normal", func(_ int, p *colly.HTMLElement) {
+				text := strings.TrimSpace(p.Text)
+				if text != "" {
+					contentParts = append(contentParts, text)
+				}
+			})
+			
+			// If no paragraphs with class "Normal", try getting all <p> tags
+			if len(contentParts) == 0 {
+				e.ForEach("p", func(_ int, p *colly.HTMLElement) {
+					text := strings.TrimSpace(p.Text)
+					// Skip author, photo credit, and other metadata
+					if text != "" && !strings.Contains(p.Attr("class"), "author") && 
+					   !strings.Contains(p.Attr("class"), "Image") {
+						contentParts = append(contentParts, text)
+					}
+				})
 			}
+			
+			textContent := strings.Join(contentParts, "\n\n")
+			
 			request := WriteRequest{
-				ArticleHtml:   html,
+				Content:       textContent,
 				Title:         title,
 				URL:           e.Request.URL.String(),
 				Description:   description,
@@ -249,12 +338,12 @@ func CreateSraper(options Options) *Scraper {
 
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
-		INSERT INTO articles(url, title, description, article_html, published_date)
+		INSERT INTO articles(url, title, description, content, published_date)
 		VALUES(?, ?, ?, ?, ?)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
-			article_html = EXCLUDED.article_html,
+			content = EXCLUDED.content,
 			published_date = EXCLUDED.published_date;
 	`
 
@@ -263,9 +352,9 @@ func (s *Scraper) ProcessWrite() {
 		log.Printf("Processing Write/Update for: **%s**\n", item.Title)
 
 		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.ArticleHtml, item.PublishedDate)
+		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.PublishedDate)
 		if err != nil {
-			log.Printf("❌ Error writing/updating article '%s' to database: %v", item.Title, err)
+			log.Printf("Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {
 			log.Printf("Successfully wrote/updated article: %s\n", item.Title)
 		}

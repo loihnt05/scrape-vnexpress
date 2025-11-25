@@ -21,7 +21,7 @@ func setupDatabase(dbPath string) (*sql.DB, error) {
 		"url" TEXT NOT NULL UNIQUE,
 		"title" TEXT,
 		"description" TEXT,
-		"article_html" TEXT,
+		"content" TEXT,
 		"scraped_at" DATETIME DEFAULT CURRENT_TIMESTAMP,
 		"published_date" DATETIME
 	);`
