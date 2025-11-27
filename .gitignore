@@ -1,3 +1,4 @@
 cache
 scraped_articles.*
 scrape-vnexpress
+.env
