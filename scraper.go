@@ -2,13 +2,18 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"database/sql"
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
+	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
+	"os"
 
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/debug"
@@ -167,6 +172,7 @@ type WriteRequest struct {
 	Description   string
 	URL           string
 	PublishedDate time.Time
+	Label         string
 }
 
 type Scraper struct {
@@ -183,6 +189,7 @@ type Options struct {
 	StartTime   time.Time
 	EndTime     time.Time
 	Parallelism int
+	DefaultLabel string
 }
 
 // categoryId 1003159
@@ -191,6 +198,10 @@ func getBatchUrl(categoryId int64, startTime time.Time, endTime time.Time) strin
 }
 
 func (s *Scraper) GetPage(startTime time.Time, endTime time.Time, categoryId int64) (string, error) {
+	// Random delay between 0.2 and 2 seconds
+	delay := time.Duration(200+rand.Intn(1800)) * time.Millisecond
+	time.Sleep(delay)
+	
 	url := getBatchUrl(categoryId, startTime, endTime)
 	res, err := s.client.Get(url)
 	if err != nil {
@@ -289,6 +300,7 @@ func (s *Scraper) Setup() {
 				URL:           e.Request.URL.String(),
 				Description:   description,
 				PublishedDate: publishedDate,
+				Label:         s.options.DefaultLabel,
 			}
 
 			s.writes <- request
@@ -308,6 +320,22 @@ func CreateSraper(options Options) *Scraper {
 	if err != nil {
 		panic(err)
 	}
+	
+	// Configure proxy URL from environment variable `PROXY_URL`.
+	// If `PROXY_URL` is empty/unset, proxy will be disabled (no proxy).
+	proxyEnv := os.Getenv("PROXY_URL")
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	if proxyEnv != "" {
+		parsedProxyURL, err := url.Parse(proxyEnv)
+		if err != nil {
+			panic(err)
+		}
+		proxyFunc = http.ProxyURL(parsedProxyURL)
+	} else {
+		// No proxy
+		proxyFunc = nil
+	}
+	
 	newsCollector := colly.NewCollector(
 		colly.CacheDir("./cache"),
 		colly.AllowedDomains("vnexpress.net"),
@@ -316,14 +344,28 @@ func CreateSraper(options Options) *Scraper {
 	)
 	newsCollector.Limit(&colly.LimitRule{DomainGlob: "*", Parallelism: options.Parallelism})
 
-	// rp, err := proxy.RoundRobinProxySwitcher("socks4://147.45.170.65:1080")
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-	// newsCollector.SetProxyFunc(rp)
+	// Configure HTTP transport with proxy for colly collector
+	newsCollector.WithTransport(&http.Transport{
+		Proxy: proxyFunc,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
+	})
+
+	// Configure retryablehttp client with proxy
+	retryClient := retryablehttp.NewClient()
+	retryClient.HTTPClient.Transport = &http.Transport{
+		Proxy: proxyFunc,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
+	}
 
 	scraper := &Scraper{
-		client:        retryablehttp.NewClient(),
+		client:        retryClient,
 		options:       options,
 		newsCollector: newsCollector,
 		writes:        make(chan WriteRequest, 10000),
@@ -337,21 +379,22 @@ func CreateSraper(options Options) *Scraper {
 
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
-		INSERT INTO articles(url, title, description, content, published_date)
-		VALUES($1, $2, $3, $4, $5)
+		INSERT INTO articles(url, title, description, content, label, published_date)
+		VALUES($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
 			content = EXCLUDED.content,
+			label = EXCLUDED.label,
 			published_date = EXCLUDED.published_date;
 	`
 
 	for item := range s.writes {
 		// Log start of processing
-		log.Printf("Processing Write/Update for: **%s**\n", item.Title)
+		log.Printf("Processing Write/Update for: **%s** (label=%s)\n", item.Title, item.Label)
 
 		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.PublishedDate)
+		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.Label, item.PublishedDate)
 		if err != nil {
 			log.Printf("Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {
@@ -375,6 +418,10 @@ func (s *Scraper) LinkExists(url string) (bool, error) {
 
 func (s *Scraper) ConsumeLinks() {
 	for link := range s.links {
+		// Random delay between 0.2 and 2 seconds
+		delay := time.Duration(200+rand.Intn(1800)) * time.Millisecond
+		time.Sleep(delay)
+		
 		err := s.newsCollector.Visit(link)
 		if err != nil {
 			log.Printf("Error visiting %s: %v\n", link, err)

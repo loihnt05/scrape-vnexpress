@@ -76,3 +76,17 @@ sudo docker compose down -v
 - PostgreSQL storage with automatic deduplication
 - Caching of HTTP requests
 - Rate limiting to respect server resources
+
+
+## Use proxy 
+```bash
+# Database Configuration
+DB_HOST=localhost
+DB_PORT=5432
+DB_USER=your-user
+DB_PASSWORD=your-password
+DB_NAME=your-name
+DB_SSLMODE=disable
+
+PROXY_URL=your-url-proxy
+```
