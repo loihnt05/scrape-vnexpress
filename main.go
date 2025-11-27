@@ -17,6 +17,7 @@ var (
 	startDate   = flag.String("start", "", "Start date in YYYY-MM-DD format (required)")
 	endDate     = flag.String("end", "", "End date in YYYY-MM-DD format (required)")
 	parallelism = flag.Int("parallelism", defaultWorkers, "Number of parallel workers")
+	labelFlag    = flag.String("label", "undefined", "Label for scraped articles: trusted|untrusted|undefined")
 	help        = flag.Bool("help", false, "Show help message")
 )
 
@@ -94,6 +95,14 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Validate label flag
+	allowed := map[string]bool{"trusted": true, "untrusted": true, "undefined": true}
+	if _, ok := allowed[*labelFlag]; !ok {
+		log.Printf("Error: invalid label '%s' (allowed: trusted, untrusted, undefined)\n\n", *labelFlag)
+		flag.Usage()
+		os.Exit(1)
+	}
+
 	// Log configuration
 	log.Printf("Starting VNExpress scraper with configuration:")
 	log.Printf("  Start Date: %s", start.Format(dateFormat))
@@ -103,9 +112,10 @@ func main() {
 
 	// Create and run scraper
 	scraper := CreateSraper(Options{
-		StartTime:   start,
-		EndTime:     end,
-		Parallelism: *parallelism,
+		StartTime:    start,
+		EndTime:      end,
+		Parallelism:  *parallelism,
+		DefaultLabel: *labelFlag,
 	})
 
 	log.Println("Starting scrape operation...")

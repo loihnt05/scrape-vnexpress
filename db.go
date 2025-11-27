@@ -50,6 +50,7 @@ func setupDatabase() (*sql.DB, error) {
 		title TEXT,
 		description TEXT,
 		content TEXT,
+		label TEXT DEFAULT 'undefined',
 		scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		published_date TIMESTAMP
 	);`
