@@ -17,7 +17,7 @@ var (
 	startDate   = flag.String("start", "", "Start date in YYYY-MM-DD format (required)")
 	endDate     = flag.String("end", "", "End date in YYYY-MM-DD format (required)")
 	parallelism = flag.Int("parallelism", defaultWorkers, "Number of parallel workers")
-	labelFlag    = flag.String("label", "undefined", "Label for scraped articles: trusted|untrusted|undefined")
+	labelFlag   = flag.String("label", "undefined", "Label for scraped articles: trusted|untrusted|undefined")
 	help        = flag.Bool("help", false, "Show help message")
 )
 

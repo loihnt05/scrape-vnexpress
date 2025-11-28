@@ -10,10 +10,10 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
-	"os"
 
 	"github.com/gocolly/colly"
 	"github.com/gocolly/colly/debug"
@@ -182,13 +182,17 @@ type Scraper struct {
 	newsCollector *colly.Collector
 	options       Options
 	wg            *sync.WaitGroup
+	producersWG   *sync.WaitGroup
+	sendersWG     *sync.WaitGroup
+	closing       bool
+	closingMu     sync.Mutex
 	db            *sql.DB
 }
 
 type Options struct {
-	StartTime   time.Time
-	EndTime     time.Time
-	Parallelism int
+	StartTime    time.Time
+	EndTime      time.Time
+	Parallelism  int
 	DefaultLabel string
 }
 
@@ -201,7 +205,7 @@ func (s *Scraper) GetPage(startTime time.Time, endTime time.Time, categoryId int
 	// Random delay between 0.2 and 2 seconds
 	delay := time.Duration(200+rand.Intn(1800)) * time.Millisecond
 	time.Sleep(delay)
-	
+
 	url := getBatchUrl(categoryId, startTime, endTime)
 	res, err := s.client.Get(url)
 	if err != nil {
@@ -216,18 +220,19 @@ func (s *Scraper) GetPage(startTime time.Time, endTime time.Time, categoryId int
 
 func (s *Scraper) Setup() {
 	s.newsCollector.OnHTML("div.container.detail-new", func(e *colly.HTMLElement) {
+		// Mark done via request context to avoid double-done with OnResponse/OnError
 		title := e.ChildText("h1.title-detail")
 		description := e.ChildText("p.description")
-		
+
 		// Parse the published date - VNExpress uses meta tags for accurate dates
 		var publishedDate time.Time
-		
+
 		// Try to get from meta tag first (most reliable)
 		metaDate := e.ChildAttr("meta[name='pubdate']", "content")
 		if metaDate == "" {
 			metaDate = e.ChildAttr("meta[property='article:published_time']", "content")
 		}
-		
+
 		if metaDate != "" {
 			// Meta tags usually use ISO8601 format
 			formats := []string{
@@ -242,36 +247,36 @@ func (s *Scraper) Setup() {
 				}
 			}
 		}
-		
-	// Fallback to visible date text
-	if publishedDate.IsZero() {
-		dateStr := e.ChildText("span.date")
-		if dateStr != "" {
-			// VNExpress format: "Thứ hai, 24/11/2025, 09:35 (GMT+7)"
-			// Remove Vietnamese day name and parse the date/time part
-			dateStr = strings.TrimSpace(dateStr)
-			
-			// Remove Vietnamese day name (everything before first comma)
-			parts := strings.SplitN(dateStr, ",", 2)
-			if len(parts) == 2 {
-				dateStr = strings.TrimSpace(parts[1])
-			}
-			
-			// Now dateStr should be like "24/11/2025, 09:35 (GMT+7)"
-			// Parse with format: "02/01/2006, 15:04 (GMT+7)"
-			parsed, err := time.Parse("2/1/2006, 15:04 (GMT+7)", dateStr)
-			if err == nil {
-				publishedDate = parsed
+
+		// Fallback to visible date text
+		if publishedDate.IsZero() {
+			dateStr := e.ChildText("span.date")
+			if dateStr != "" {
+				// VNExpress format: "Thứ hai, 24/11/2025, 09:35 (GMT+7)"
+				// Remove Vietnamese day name and parse the date/time part
+				dateStr = strings.TrimSpace(dateStr)
+
+				// Remove Vietnamese day name (everything before first comma)
+				parts := strings.SplitN(dateStr, ",", 2)
+				if len(parts) == 2 {
+					dateStr = strings.TrimSpace(parts[1])
+				}
+
+				// Now dateStr should be like "24/11/2025, 09:35 (GMT+7)"
+				// Parse with format: "02/01/2006, 15:04 (GMT+7)"
+				parsed, err := time.Parse("2/1/2006, 15:04 (GMT+7)", dateStr)
+				if err == nil {
+					publishedDate = parsed
+				}
 			}
 		}
-	}
-	
-	log.Printf("Extracted date for '%s': %v (raw meta: %s)\n", title, publishedDate, metaDate)
-		
+
+		log.Printf("Extracted date for '%s': %v (raw meta: %s)\n", title, publishedDate, metaDate)
+
 		e.ForEach("article.fck_detail ", func(i int, e *colly.HTMLElement) {
 			// Extract all paragraph text from the article
 			var contentParts []string
-			
+
 			// Get text from all paragraphs in the article
 			e.ForEach("p.Normal", func(_ int, p *colly.HTMLElement) {
 				text := strings.TrimSpace(p.Text)
@@ -279,21 +284,21 @@ func (s *Scraper) Setup() {
 					contentParts = append(contentParts, text)
 				}
 			})
-			
+
 			// If no paragraphs with class "Normal", try getting all <p> tags
 			if len(contentParts) == 0 {
 				e.ForEach("p", func(_ int, p *colly.HTMLElement) {
 					text := strings.TrimSpace(p.Text)
 					// Skip author, photo credit, and other metadata
-					if text != "" && !strings.Contains(p.Attr("class"), "author") && 
-					   !strings.Contains(p.Attr("class"), "Image") {
+					if text != "" && !strings.Contains(p.Attr("class"), "author") &&
+						!strings.Contains(p.Attr("class"), "Image") {
 						contentParts = append(contentParts, text)
 					}
 				})
 			}
-			
+
 			textContent := strings.Join(contentParts, "\n\n")
-			
+
 			request := WriteRequest{
 				Content:       textContent,
 				Title:         title,
@@ -303,10 +308,36 @@ func (s *Scraper) Setup() {
 				Label:         s.options.DefaultLabel,
 			}
 
-			s.writes <- request
+			// Send the write safely: avoid panic if writes is being closed concurrently.
+			s.closingMu.Lock()
+			if s.closing {
+				s.closingMu.Unlock()
+				return
+			}
+			s.sendersWG.Add(1)
+			s.closingMu.Unlock()
+
+			func() {
+				defer s.sendersWG.Done()
+				s.writes <- request
+			}()
 
 		})
 
+	})
+	// Ensure that for every Visit we call Done exactly once. We use the request's
+	// context to mark whether the request has been accounted for.
+	// When an OnHTML handler finishes it should mark the request done. For
+	// requests that never hit the OnHTML selector (or on error), OnError will
+	// mark them done. This avoids closing `writes` before handlers send.
+	s.newsCollector.OnError(func(r *colly.Response, err error) {
+		if r == nil || r.Request == nil {
+			return
+		}
+		if r.Request.Ctx.Get("done") == "" {
+			r.Request.Ctx.Put("done", "1")
+			s.producersWG.Done()
+		}
 	})
 	extensions.RandomUserAgent(s.newsCollector)
 	extensions.Referer(s.newsCollector)
@@ -320,7 +351,7 @@ func CreateSraper(options Options) *Scraper {
 	if err != nil {
 		panic(err)
 	}
-	
+
 	// Configure proxy URL from environment variable `PROXY_URL`.
 	// If `PROXY_URL` is empty/unset, proxy will be disabled (no proxy).
 	proxyEnv := os.Getenv("PROXY_URL")
@@ -335,7 +366,7 @@ func CreateSraper(options Options) *Scraper {
 		// No proxy
 		proxyFunc = nil
 	}
-	
+
 	newsCollector := colly.NewCollector(
 		colly.CacheDir("./cache"),
 		colly.AllowedDomains("vnexpress.net"),
@@ -371,6 +402,9 @@ func CreateSraper(options Options) *Scraper {
 		writes:        make(chan WriteRequest, 10000),
 		links:         make(chan string, 10000),
 		wg:            &sync.WaitGroup{},
+		producersWG:   &sync.WaitGroup{},
+		sendersWG:     &sync.WaitGroup{},
+		closing:       false,
 		db:            db,
 	}
 	scraper.Setup()
@@ -421,21 +455,33 @@ func (s *Scraper) ConsumeLinks() {
 		// Random delay between 0.2 and 2 seconds
 		delay := time.Duration(200+rand.Intn(1800)) * time.Millisecond
 		time.Sleep(delay)
-		
+
+		// Track this visit so we can wait for its handlers to finish before closing writes
+		s.producersWG.Add(1)
 		err := s.newsCollector.Visit(link)
 		if err != nil {
+			// If Visit failed immediately, mark as done to avoid leaking the counter
+			s.producersWG.Done()
 			log.Printf("Error visiting %s: %v\n", link, err)
 		}
 	}
 }
 
 func (s *Scraper) Scrape() {
-	s.wg.Go(s.ProcessWrite)
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		s.ProcessWrite()
+	}()
 
 	// Start link consumers
 	numConsumers := 3
 	for i := 0; i < numConsumers; i++ {
-		s.wg.Go(s.ConsumeLinks)
+		s.wg.Add(1)
+		go func() {
+			defer s.wg.Done()
+			s.ConsumeLinks()
+		}()
 	}
 
 	// Start iterating from the initial StartTime
@@ -455,7 +501,12 @@ func (s *Scraper) Scrape() {
 		}
 
 		for categoryId := range categories {
-			linkGeneratorWg.Go(func() {
+			cid := categoryId
+			ds := dayStart
+			de := scrapeEnd
+			linkGeneratorWg.Add(1)
+			go func(categoryId int, dayStart time.Time, scrapeEnd time.Time) {
+				defer linkGeneratorWg.Done()
 				err := limiter.Wait(context.Background())
 				if err != nil {
 					panic(err)
@@ -481,7 +532,7 @@ func (s *Scraper) Scrape() {
 					}
 					s.links <- link
 				}
-			})
+			}(cid, ds, de)
 		}
 
 		currentTime = nextDayStart
@@ -492,6 +543,15 @@ func (s *Scraper) Scrape() {
 
 	s.newsCollector.Wait()
 
+	// Ensure all OnHTML producers have finished sending to the writes channel
+	s.producersWG.Wait()
+
+	// Prevent new senders and wait for any in-flight senders to finish,
+	// then close the writes channel safely.
+	s.closingMu.Lock()
+	s.closing = true
+	s.closingMu.Unlock()
+	s.sendersWG.Wait()
 	close(s.writes)
 
 	s.wg.Wait()

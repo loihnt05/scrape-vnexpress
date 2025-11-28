@@ -29,7 +29,7 @@ func getPostgresConnectionString() string {
 
 func setupDatabase() (*sql.DB, error) {
 	connStr := getPostgresConnectionString()
-	
+
 	// 1. Open the database connection
 	db, err := sql.Open("postgres", connStr)
 	if err != nil {
@@ -69,7 +69,7 @@ func setupDatabase() (*sql.DB, error) {
 		return nil, fmt.Errorf("error creating index: %w", err)
 	}
 
-	fmt.Printf("Database initialized: %s@%s:%s/%s\n", 
+	fmt.Printf("Database initialized: %s@%s:%s/%s\n",
 		getEnv("DB_USER", "vnexpress"),
 		getEnv("DB_HOST", "localhost"),
 		getEnv("DB_PORT", "5432"),
