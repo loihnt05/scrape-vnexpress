@@ -93,7 +93,6 @@ func extractTextContent(htmlContent string) string {
 
 var categories = map[int]string{
 	1001005: "Thời sự",
-
 	1001002: "Thế giới",
 	1003159: "Kinh doanh",
 	1005628: "Bất động sản",
@@ -173,6 +172,7 @@ type WriteRequest struct {
 	URL           string
 	PublishedDate time.Time
 	Label         string
+	Category      string
 }
 
 type Scraper struct {
@@ -223,6 +223,21 @@ func (s *Scraper) Setup() {
 		// Mark done via request context to avoid double-done with OnResponse/OnError
 		title := e.ChildText("h1.title-detail")
 		description := e.ChildText("p.description")
+
+		// Extract category from breadcrumb navigation
+		category := "unknown"
+		e.ForEach("a[data-medium]", func(_ int, el *colly.HTMLElement) {
+			dataMedium := el.Attr("data-medium")
+			// data-medium format: "Menu-GiaiTri", "Menu-TheGioi", etc.
+			// Get only the first main category (skip if already found)
+			if category == "unknown" && strings.HasPrefix(dataMedium, "Menu-") {
+				// Extract the category text (e.g., "Giải trí", "Thế giới")
+				categoryText := el.Text
+				if categoryText != "" {
+					category = categoryText
+				}
+			}
+		})
 
 		// Parse the published date - VNExpress uses meta tags for accurate dates
 		var publishedDate time.Time
@@ -306,6 +321,7 @@ func (s *Scraper) Setup() {
 				Description:   description,
 				PublishedDate: publishedDate,
 				Label:         s.options.DefaultLabel,
+				Category:      category,
 			}
 
 			// Send the write safely: avoid panic if writes is being closed concurrently.
@@ -413,22 +429,23 @@ func CreateSraper(options Options) *Scraper {
 
 func (s *Scraper) ProcessWrite() {
 	upsertSQL := `
-		INSERT INTO articles(url, title, description, content, label, published_date)
-		VALUES($1, $2, $3, $4, $5, $6)
+		INSERT INTO articles(url, title, description, content, label, published_date, category)
+		VALUES($1, $2, $3, $4, $5, $6, $7)
 		ON CONFLICT (url) DO UPDATE SET
 			title = EXCLUDED.title,
 			description = EXCLUDED.description,
 			content = EXCLUDED.content,
 			label = EXCLUDED.label,
-			published_date = EXCLUDED.published_date;
+			published_date = EXCLUDED.published_date,
+			category = EXCLUDED.category;
 	`
 
 	for item := range s.writes {
 		// Log start of processing
-		log.Printf("Processing Write/Update for: **%s** (label=%s)\n", item.Title, item.Label)
+		log.Printf("Processing Write/Update for: **%s** (label=%s, category=%s)\n", item.Title, item.Label, item.Category)
 
 		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.Label, item.PublishedDate)
+		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.Label, item.PublishedDate, item.Category)
 		if err != nil {
 			log.Printf("Error writing/updating article '%s' to database: %v", item.Title, err)
 		} else {

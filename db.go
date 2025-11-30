@@ -52,7 +52,8 @@ func setupDatabase() (*sql.DB, error) {
 		content TEXT,
 		label TEXT DEFAULT 'undefined',
 		scraped_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-		published_date TIMESTAMP
+		published_date TIMESTAMP,
+		category TEXT
 	);`
 
 	_, err = db.Exec(createTableSQL)
@@ -61,7 +62,24 @@ func setupDatabase() (*sql.DB, error) {
 		return nil, fmt.Errorf("error creating table: %w", err)
 	}
 
-	// 4. Create index on URL for faster lookups
+	// 4. Add category column if it doesn't exist (for existing databases)
+	alterTableSQL := `
+	DO $$
+	BEGIN
+		IF NOT EXISTS (
+			SELECT 1 FROM information_schema.columns 
+			WHERE table_name='articles' AND column_name='category'
+		) THEN
+			ALTER TABLE articles ADD COLUMN category TEXT;
+		END IF;
+	END $$;`
+	_, err = db.Exec(alterTableSQL)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("error adding category column: %w", err)
+	}
+
+	// 5. Create index on URL for faster lookups
 	createIndexSQL := `CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url);`
 	_, err = db.Exec(createIndexSQL)
 	if err != nil {
