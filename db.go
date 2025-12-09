@@ -42,10 +42,18 @@ func setupDatabase() (*sql.DB, error) {
 		return nil, fmt.Errorf("error connecting to database: %w", err)
 	}
 
-	// 3. Create the articles table if it doesn't exist
+	// 3. Enable uuid-ossp extension for UUID generation
+	enableUUIDSQL := `CREATE EXTENSION IF NOT EXISTS "uuid-ossp";`
+	_, err = db.Exec(enableUUIDSQL)
+	if err != nil {
+		db.Close()
+		return nil, fmt.Errorf("error enabling uuid-ossp extension: %w", err)
+	}
+
+	// 4. Create the articles table if it doesn't exist
 	createTableSQL := `
 	CREATE TABLE IF NOT EXISTS articles (
-		id SERIAL PRIMARY KEY,
+		id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
 		url TEXT NOT NULL UNIQUE,
 		title TEXT,
 		description TEXT,
@@ -62,7 +70,7 @@ func setupDatabase() (*sql.DB, error) {
 		return nil, fmt.Errorf("error creating table: %w", err)
 	}
 
-	// 4. Add category column if it doesn't exist (for existing databases)
+	// 5. Add category column if it doesn't exist (for existing databases)
 	alterTableSQL := `
 	DO $$
 	BEGIN
@@ -79,7 +87,7 @@ func setupDatabase() (*sql.DB, error) {
 		return nil, fmt.Errorf("error adding category column: %w", err)
 	}
 
-	// 5. Create index on URL for faster lookups
+	// 6. Create index on URL for faster lookups
 	createIndexSQL := `CREATE INDEX IF NOT EXISTS idx_articles_url ON articles(url);`
 	_, err = db.Exec(createIndexSQL)
 	if err != nil {
