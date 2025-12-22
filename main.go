@@ -14,10 +14,9 @@ const (
 )
 
 var (
-	startDate   = flag.String("start", "", "Start date in YYYY-MM-DD format (required)")
-	endDate     = flag.String("end", "", "End date in YYYY-MM-DD format (required)")
+	startDate   = flag.String("start", "", "Start date in YYYY-MM-DD format (optional, defaults to last scrape time)")
+	endDate     = flag.String("end", "", "End date in YYYY-MM-DD format (optional, defaults to now)")
 	parallelism = flag.Int("parallelism", defaultWorkers, "Number of parallel workers")
-	labelFlag   = flag.String("label", "undefined", "Label for scraped articles: trusted|untrusted|undefined")
 	help        = flag.Bool("help", false, "Show help message")
 )
 
@@ -27,14 +26,20 @@ func init() {
 		fmt.Fprintf(os.Stderr, "Usage: %s [options]\n\n", os.Args[0])
 		fmt.Fprintf(os.Stderr, "Options:\n")
 		flag.PrintDefaults()
-		fmt.Fprintf(os.Stderr, "\nExample:\n")
-		fmt.Fprintf(os.Stderr, "  %s -start 2020-01-01 -end 2020-02-01 -parallelism 4\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "\nExamples:\n")
+		fmt.Fprintf(os.Stderr, "  # Scrape from last saved timestamp to now (automatic)\n")
+		fmt.Fprintf(os.Stderr, "  %s\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # Scrape specific date range\n")
+		fmt.Fprintf(os.Stderr, "  %s -start 2020-01-01 -end 2020-02-01 -parallelism 4\n\n", os.Args[0])
+		fmt.Fprintf(os.Stderr, "  # Scrape from specific date to now\n")
+		fmt.Fprintf(os.Stderr, "  %s -start 2020-01-01\n", os.Args[0])
 	}
 }
 
 func parseDate(dateStr string, fieldName string) (time.Time, error) {
 	if dateStr == "" {
-		return time.Time{}, fmt.Errorf("%s is required", fieldName)
+		// Empty date is now valid, will be handled by caller
+		return time.Time{}, nil
 	}
 
 	parsedDate, err := time.Parse(dateFormat, dateStr)
@@ -46,11 +51,7 @@ func parseDate(dateStr string, fieldName string) (time.Time, error) {
 }
 
 func validateOptions(start, end time.Time, workers int) error {
-	if start.IsZero() || end.IsZero() {
-		return fmt.Errorf("start and end dates are required")
-	}
-
-	if end.Before(start) {
+	if !start.IsZero() && !end.IsZero() && end.Before(start) {
 		return fmt.Errorf("end date must be after start date")
 	}
 
@@ -88,17 +89,20 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Auto-detect date range if not provided
+	if start.IsZero() {
+		start = GetLastScrapedTime()
+		log.Printf("Using auto-detected start date from last scrape: %s\n", start.Format(dateFormat))
+	}
+
+	if end.IsZero() {
+		end = time.Now()
+		log.Printf("Using current time as end date: %s\n", end.Format(dateFormat))
+	}
+
 	// Validate options
 	if err := validateOptions(start, end, *parallelism); err != nil {
 		log.Printf("Error: %v\n\n", err)
-		flag.Usage()
-		os.Exit(1)
-	}
-
-	// Validate label flag
-	allowed := map[string]bool{"trusted": true, "untrusted": true, "undefined": true}
-	if _, ok := allowed[*labelFlag]; !ok {
-		log.Printf("Error: invalid label '%s' (allowed: trusted, untrusted, undefined)\n\n", *labelFlag)
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -112,13 +116,18 @@ func main() {
 
 	// Create and run scraper
 	scraper := CreateSraper(Options{
-		StartTime:    start,
-		EndTime:      end,
-		Parallelism:  *parallelism,
-		DefaultLabel: *labelFlag,
+		StartTime:   start,
+		EndTime:     end,
+		Parallelism: *parallelism,
 	})
 
 	log.Println("Starting scrape operation...")
 	scraper.Scrape()
+	
+	// Save the end time as the last scraped timestamp
+	if err := SaveLastScrapedTime(end); err != nil {
+		log.Printf("Warning: Failed to save last scraped timestamp: %v\n", err)
+	}
+	
 	log.Println("Scrape operation completed successfully")
 }

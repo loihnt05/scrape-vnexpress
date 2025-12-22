@@ -1,62 +1,130 @@
 # VNExpress Scraper
 
-A Go-based web scraper for VNExpress articles with PostgreSQL storage.
+A Go-based web scraper for VNExpress articles designed for Kafka integration with automatic incremental scraping.
 
-## Setup
+## Features
 
-### 1. Start PostgreSQL
+✅ **Auto-Scraping**: Automatically tracks last scrape time and scrapes incrementally  
+✅ **Kafka-Ready**: Outputs data in structured format for Kafka producer  
+✅ **No Database Required**: Removed PostgreSQL dependency  
+✅ **Rate Limiting**: Built-in rate limiting and random delays  
+✅ **Parallel Processing**: Configurable parallel workers  
+✅ **Category Support**: Scrapes all major VNExpress categories  
+
+## Quick Start
+
+### 1. Build the Application
 ```bash
-sudo docker compose up -d
+go build -o scrape-vnexpress
 ```
 
-### 2. Check Database Status
+### 2. Run the Scraper (Auto Mode)
 ```bash
-sudo docker compose ps
+# First run: scrapes last 7 days
+./scrape-vnexpress
+
+# Subsequent runs: scrapes from last run to now
+./scrape-vnexpress
 ```
 
-### 3. Build the Application
+### 3. Manual Date Range (Optional)
 ```bash
-go build
+# Scrape specific date range
+./scrape-vnexpress -start 2024-01-01 -end 2024-01-31 -parallelism 4
+
+# Scrape from specific date to now
+./scrape-vnexpress -start 2024-12-01
 ```
 
-### 4. Run the Scraper
+## How Auto-Scraping Works
+
+The scraper tracks the last scrape time in `.last_scraped_at` file:
+
+1. **First Run**: Scrapes from 7 days ago to now
+2. **Subsequent Runs**: Scrapes from last saved time to now  
+3. **After Each Run**: Updates timestamp to current time
+
+See [AUTO_SCRAPE_GUIDE.md](AUTO_SCRAPE_GUIDE.md) for detailed documentation.
+
+## Configuration
+
+### Environment Variables
+
+- `PROXY_URL`: Optional HTTP/HTTPS proxy (e.g., `http://proxy:8080`)
+
+### Command Line Options
+
 ```bash
-./scrape-vnexpress -start 2025-11-24 -end 2025-11-25 -parallelism 2
+./scrape-vnexpress [options]
+
+Options:
+  -start string
+        Start date in YYYY-MM-DD format (optional, defaults to last scrape time)
+  -end string
+        End date in YYYY-MM-DD format (optional, defaults to now)
+  -parallelism int
+        Number of parallel workers (default 4)
+  -help
+        Show help message
 ```
 
-## Database Configuration
+## Output Format
 
-The application uses environment variables for database configuration (defaults shown):
+Each scraped article is emitted as an `ArticleResult` with this structure:
 
-- `DB_HOST=localhost`
-- `DB_PORT=5432`
-- `DB_USER=vnexpress`
-- `DB_PASSWORD=vnexpress123`
-- `DB_NAME=vnexpress_scraper`
-- `DB_SSLMODE=disable`
-
-See `.env.example` for reference.
-
-## Database Management
-
-### Connect to PostgreSQL
-```bash
-sudo docker exec -it vnexpress-postgres psql -U vnexpress -d vnexpress_scraper
+```json
+{
+  "url": "https://vnexpress.net/article-url",
+  "title": "Article Title",
+  "content": "Full article content...",
+  "published_date": "2024-01-01 10:30:00",
+  "scraped_at": "2024-12-22 15:45:00",
+  "category": "Thời sự"
+}
 ```
 
-### View Tables
-```sql
-\dt
-```
+See [KAFKA_MIGRATION.md](KAFKA_MIGRATION.md) for Kafka integration details.
 
-### Query Articles
-```sql
-SELECT url, title, published_date FROM articles LIMIT 10;
-```
+## Supported Categories
 
-### Count Articles
-```sql
-SELECT COUNT(*) FROM articles;
+- Thời sự (Politics)
+- Thế giới (World)
+- Kinh doanh (Business)
+- Bất động sản (Real Estate)
+- Giải trí (Entertainment)
+- Thể thao (Sports)
+- Pháp luật (Law)
+- Giáo dục (Education)
+- Sức khỏe (Health)
+- Đời sống (Lifestyle)
+- Du lịch (Travel)
+- Khoa học công nghệ (Technology)
+- Xe (Automotive)
+- Ý kiến (Opinion)
+- And more...
+
+## Documentation
+
+- [AUTO_SCRAPE_GUIDE.md](AUTO_SCRAPE_GUIDE.md) - Auto-scraping and scheduling guide
+- [KAFKA_MIGRATION.md](KAFKA_MIGRATION.md) - Kafka integration and migration details
+- [kafka_example.go](kafka_example.go) - Example code for Kafka integration
+
+## Architecture
+
+```
+Input: Date Range (auto or manual)
+  ↓
+Link Generator (by category & date)
+  ↓
+Link Queue (buffered channel)
+  ↓
+Link Consumers (parallel workers)
+  ↓
+Article Scraper (colly)
+  ↓
+Results Channel → Your Kafka Producer
+  ↓
+.last_scraped_at (timestamp tracking)
 ```
 
 ### Stop Database

@@ -2,3 +2,4 @@ cache
 scraped_articles.*
 scrape-vnexpress
 .env
+.last_scraped_at

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"database/sql"
 	"fmt"
 	"io"
 	"log"
@@ -165,18 +164,32 @@ func extractLinksFromTitleNews(htmlContent string) []string {
 	return links
 }
 
-type WriteRequest struct {
-	Content       string
-	Title         string
-	Description   string
-	URL           string
-	PublishedDate time.Time
-	Label         string
-	Category      string
+// ArticleResult represents the scraped article data for Kafka producer
+// Matches the articles table schema (without id, embedding, extracted_facts, label)
+type ArticleResult struct {
+	URL           string    `json:"url"`            // Article URL
+	Title         string    `json:"title"`          // Article title
+	Content       string    `json:"content"`        // Full article content
+	PublishedDate time.Time `json:"published_date"` // Published date from news source
+	ScrapedAt     time.Time `json:"scraped_at"`     // Crawl time
+	Category      string    `json:"category"`       // Category (e.g. Politics, Economy)
+}
+
+// ToJSON converts ArticleResult to the required JSON format for Kafka
+// Returns a map with string-formatted dates
+func (a *ArticleResult) ToJSON() map[string]interface{} {
+	return map[string]interface{}{
+		"url":            a.URL,
+		"title":          a.Title,
+		"content":        a.Content,
+		"published_date": a.PublishedDate.Format("2006-01-02 15:04:05"),
+		"scraped_at":     a.ScrapedAt.Format("2006-01-02 15:04:05"),
+		"category":       a.Category,
+	}
 }
 
 type Scraper struct {
-	writes        chan WriteRequest
+	results       chan ArticleResult // Channel for scraped articles (for Kafka consumption)
 	links         chan string
 	client        *retryablehttp.Client
 	newsCollector *colly.Collector
@@ -186,14 +199,12 @@ type Scraper struct {
 	sendersWG     *sync.WaitGroup
 	closing       bool
 	closingMu     sync.Mutex
-	db            *sql.DB
 }
 
 type Options struct {
-	StartTime    time.Time
-	EndTime      time.Time
-	Parallelism  int
-	DefaultLabel string
+	StartTime   time.Time
+	EndTime     time.Time
+	Parallelism int
 }
 
 // categoryId 1003159
@@ -222,7 +233,6 @@ func (s *Scraper) Setup() {
 	s.newsCollector.OnHTML("div.container.detail-new", func(e *colly.HTMLElement) {
 		// Mark done via request context to avoid double-done with OnResponse/OnError
 		title := e.ChildText("h1.title-detail")
-		description := e.ChildText("p.description")
 
 		// Extract category from breadcrumb navigation
 		category := "unknown"
@@ -314,17 +324,16 @@ func (s *Scraper) Setup() {
 
 			textContent := strings.Join(contentParts, "\n\n")
 
-			request := WriteRequest{
-				Content:       textContent,
-				Title:         title,
+			result := ArticleResult{
 				URL:           e.Request.URL.String(),
-				Description:   description,
+				Title:         title,
+				Content:       textContent,
 				PublishedDate: publishedDate,
-				Label:         s.options.DefaultLabel,
+				ScrapedAt:     time.Now(), // Current time as scrape time
 				Category:      category,
 			}
 
-			// Send the write safely: avoid panic if writes is being closed concurrently.
+			// Send the result safely: avoid panic if results channel is being closed concurrently.
 			s.closingMu.Lock()
 			if s.closing {
 				s.closingMu.Unlock()
@@ -335,7 +344,7 @@ func (s *Scraper) Setup() {
 
 			func() {
 				defer s.sendersWG.Done()
-				s.writes <- request
+				s.results <- result
 			}()
 
 		})
@@ -362,10 +371,6 @@ func (s *Scraper) Setup() {
 func CreateSraper(options Options) *Scraper {
 	if options.Parallelism == 0 {
 		options.Parallelism = 4
-	}
-	db, err := setupDatabase()
-	if err != nil {
-		panic(err)
 	}
 
 	// Configure proxy URL from environment variable `PROXY_URL`.
@@ -415,56 +420,29 @@ func CreateSraper(options Options) *Scraper {
 		client:        retryClient,
 		options:       options,
 		newsCollector: newsCollector,
-		writes:        make(chan WriteRequest, 10000),
+		results:       make(chan ArticleResult, 10000),
 		links:         make(chan string, 10000),
 		wg:            &sync.WaitGroup{},
 		producersWG:   &sync.WaitGroup{},
 		sendersWG:     &sync.WaitGroup{},
 		closing:       false,
-		db:            db,
 	}
 	scraper.Setup()
 	return scraper
 }
 
-func (s *Scraper) ProcessWrite() {
-	upsertSQL := `
-		INSERT INTO articles(url, title, description, content, label, published_date, category)
-		VALUES($1, $2, $3, $4, $5, $6, $7)
-		ON CONFLICT (url) DO UPDATE SET
-			title = EXCLUDED.title,
-			description = EXCLUDED.description,
-			content = EXCLUDED.content,
-			label = EXCLUDED.label,
-			published_date = EXCLUDED.published_date,
-			category = EXCLUDED.category;
-	`
-
-	for item := range s.writes {
-		// Log start of processing
-		log.Printf("Processing Write/Update for: **%s** (label=%s, category=%s)\n", item.Title, item.Label, item.Category)
-
-		// Execute the SQL upsert
-		_, err := s.db.Exec(upsertSQL, item.URL, item.Title, item.Description, item.Content, item.Label, item.PublishedDate, item.Category)
-		if err != nil {
-			log.Printf("Error writing/updating article '%s' to database: %v", item.Title, err)
-		} else {
-			log.Printf("Successfully wrote/updated article: %s\n", item.Title)
-		}
-	}
+// GetResults returns the channel of scraped articles for Kafka producer consumption
+// This channel will be closed when scraping is complete
+func (s *Scraper) GetResults() <-chan ArticleResult {
+	return s.results
 }
 
-// LinkExists checks whether a given URL already exists in the articles table.
-func (s *Scraper) LinkExists(url string) (bool, error) {
-	var v int
-	err := s.db.QueryRow("SELECT 1 FROM articles WHERE url = $1 LIMIT 1", url).Scan(&v)
-	if err == sql.ErrNoRows {
-		return false, nil
+// ProcessResults logs scraped articles (can be replaced with Kafka producer logic)
+func (s *Scraper) ProcessResults() {
+	for result := range s.results {
+		log.Printf("Scraped article: '%s' (category=%s, url=%s)\n", 
+			result.Title, result.Category, result.URL)
 	}
-	if err != nil {
-		return false, err
-	}
-	return true, nil
 }
 
 func (s *Scraper) ConsumeLinks() {
@@ -488,7 +466,7 @@ func (s *Scraper) Scrape() {
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
-		s.ProcessWrite()
+		s.ProcessResults()
 	}()
 
 	// Start link consumers
@@ -536,17 +514,7 @@ func (s *Scraper) Scrape() {
 				links := extractLinksFromTitleNews(result)
 
 				for _, link := range links {
-					// Check DB to avoid refetching links we've already saved
-					exists, err := s.LinkExists(link)
-					if err != nil {
-						log.Printf("error checking link existence for %s: %v — will queue it", link, err)
-						s.links <- link
-						continue
-					}
-					if exists {
-						log.Printf("Skipping already-saved link: %s\n", link)
-						continue
-					}
+					// Queue all links (no database check needed)
 					s.links <- link
 				}
 			}(cid, ds, de)
@@ -560,16 +528,16 @@ func (s *Scraper) Scrape() {
 
 	s.newsCollector.Wait()
 
-	// Ensure all OnHTML producers have finished sending to the writes channel
+	// Ensure all OnHTML producers have finished sending to the results channel
 	s.producersWG.Wait()
 
 	// Prevent new senders and wait for any in-flight senders to finish,
-	// then close the writes channel safely.
+	// then close the results channel safely.
 	s.closingMu.Lock()
 	s.closing = true
 	s.closingMu.Unlock()
 	s.sendersWG.Wait()
-	close(s.writes)
+	close(s.results)
 
 	s.wg.Wait()
 }
